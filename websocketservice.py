@@ -1,0 +1,229 @@
+import asyncio
+import serial
+import time
+import json
+import threading
+import paho.mqtt.client as mqtt
+from pydantic import BaseModel, Field
+from typing import Dict, Any, Optional
+from fastapi import FastAPI, HTTPException
+
+app = FastAPI()
+
+# --- Global In-Memory State ---
+device_state = {
+    "device_status": "Offline",
+    "cascade_mode": "Unknown",
+    "outputs": {
+        "output_1_source": "Unknown",
+        "output_2_source": "Unknown"
+    },
+    "inputs_edid_index": {
+        "input_1_edid_index": "Unknown",
+        "input_2_edid_index": "Unknown",
+        "input_3_edid_index": "Unknown",
+        "input_4_edid_index": "Unknown"
+    }
+}
+
+# --- Configuration ---
+MQTT_BROKER = "192.168.60.16"
+MQTT_PORT = 1883
+MQTT_TOPIC_STATUS = "serial/status"
+MQTT_TOPIC_CONTROL_ROOT = "serial/control"
+
+# --- Serial & Locking ---
+# We need a lock because MQTT (Thread A) and REST API (Thread B) might write simultaneously
+serial_lock = threading.Lock()
+serial_message_queue: asyncio.Queue[str] = asyncio.Queue()
+
+try:
+    ser = serial.Serial('/dev/ttyUSB0', baudrate=57600, timeout=1)
+    device_state["device_status"] = "Online"
+except Exception as e:
+    print(f"Serial Port Error: {e}")
+    ser = None
+    device_state["device_status"] = f"Error: {e}"
+
+# --- Helper: Thread-Safe Serial Write ---
+def safe_serial_write(command: str):
+    """Writes to serial port using a lock to prevent collisions."""
+    with serial_lock:
+        if ser and ser.is_open:
+            try:
+                print(f"TX: {command}")
+                ser.write(f"{command}\r".encode('utf-8'))
+            except Exception as e:
+                print(f"Serial Write Error: {e}")
+
+# --- MQTT Callbacks ---
+
+def on_connect(client, userdata, flags, rc):
+    """Subscribes to control topics upon connection."""
+    print(f"Connected to MQTT Broker with result code {rc}")
+    # Subscribe to all control topics
+    client.subscribe(f"{MQTT_TOPIC_CONTROL_ROOT}/#")
+
+def on_message(client, userdata, msg):
+    """
+    Handles incoming MQTT commands.
+    Supported Topics:
+      - serial/control/refresh  (Payload: any)
+      - serial/control/switch   (Payload: {"output": 1, "input": 2})
+      - serial/control/edid     (Payload: {"input": 1, "index": 3})
+    """
+    topic = msg.topic
+    try:
+        payload = msg.payload.decode("utf-8")
+        data = json.loads(payload) if payload else {}
+    except json.JSONDecodeError:
+        data = {}
+
+    print(f"MQTT RX: {topic} | {payload}")
+
+    if topic.endswith("/refresh"):
+        # Trigger a full status query
+        # We schedule this on the main event loop to handle the delays properly
+        asyncio.run_coroutine_threadsafe(perform_initial_state_query(), app.loop)
+
+    elif topic.endswith("/switch"):
+        # Switch Output Source
+        out_num = data.get("output")
+        in_num = data.get("input")
+        if out_num is not None and in_num is not None:
+            cmd = f"EZS OUT{out_num} VS IN{in_num}"
+            safe_serial_write(cmd)
+
+    elif topic.endswith("/edid"):
+        # Set EDID
+        in_num = data.get("input")
+        idx = data.get("index")
+        if in_num is not None and idx is not None:
+            cmd = f"EZS IN{in_num} EDID {idx}"
+            safe_serial_write(cmd)
+
+# Initialize MQTT Client
+mqtt_client = mqtt.Client()
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message
+
+# --- State Parsing Logic (Same as before) ---
+def update_state_from_serial(line: str):
+    line = line.strip()
+    if not line:
+        return
+        
+    parts = line.split()
+    if not parts:
+        return
+
+    value = parts[-1]
+    line_upper = line.upper()
+    
+    if "CAS" in line_upper:
+        device_state["cascade_mode"] = value
+    elif "OUT1 VS" in line_upper:
+        device_state["outputs"]["output_1_source"] = value
+    elif "OUT2 VS" in line_upper:
+        device_state["outputs"]["output_2_source"] = value
+    elif "IN1 EDID" in line_upper:
+        device_state["inputs_edid_index"]["input_1_edid_index"] = value
+    elif "IN2 EDID" in line_upper:
+        device_state["inputs_edid_index"]["input_2_edid_index"] = value
+    elif "IN3 EDID" in line_upper:
+        device_state["inputs_edid_index"]["input_3_edid_index"] = value
+    elif "IN4 EDID" in line_upper:
+        device_state["inputs_edid_index"]["input_4_edid_index"] = value
+
+# --- Background Tasks ---
+
+async def serial_reader_task():
+    """Reads from serial port continuously."""
+    while True:
+        if ser and ser.is_open:
+            try:
+                # Use executor for blocking read
+                line_bytes = await asyncio.to_thread(ser.readline)
+                line = line_bytes.decode('utf-8').strip()
+                if line:
+                    print(f"RX: {line}")
+                    await serial_message_queue.put(line)
+            except Exception as e:
+                print(f"Serial Read Error: {e}")
+                await asyncio.sleep(1)
+        else:
+            await asyncio.sleep(1)
+
+async def status_processor_task():
+    """Updates memory and pushes to MQTT."""
+    while True:
+        raw_message = await serial_message_queue.get()
+        update_state_from_serial(raw_message)
+        
+        update_payload = {
+            "timestamp": time.time(),
+            "raw_data": raw_message,
+            "current_state": device_state
+        }
+        
+        try:
+            mqtt_client.publish(MQTT_TOPIC_STATUS, json.dumps(update_payload))
+        except Exception as e:
+            print(f"MQTT Publish Error: {e}")
+
+async def perform_initial_state_query():
+    """Sends queries to populate the memory."""
+    print("Performing state query...")
+    queries = ["EZG STA", "EZG CAS"]
+    
+    for cmd in queries:
+        safe_serial_write(cmd)
+        await asyncio.sleep(0.1) 
+
+# --- Lifecycle Events ---
+
+@app.on_event("startup")
+async def startup_event():
+    # Store the loop for thread-safe calling from MQTT thread
+    app.loop = asyncio.get_running_loop()
+    
+    try:
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.loop_start()
+    except Exception as e:
+        print(f"MQTT Connection Failed: {e}")
+
+    asyncio.create_task(serial_reader_task())
+    asyncio.create_task(status_processor_task())
+    asyncio.create_task(perform_initial_state_query())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    mqtt_client.loop_stop()
+    mqtt_client.disconnect()
+
+# --- REST Endpoints (Using safe_serial_write) ---
+
+@app.get("/status")
+def get_system_status() -> Dict[str, Any]:
+    return device_state
+
+class EdidUpdateRequest(BaseModel):
+    input_number: int = Field(..., ge=0, le=4)
+    edid_index: int = Field(..., ge=0, le=16)
+
+@app.post("/edid/set")
+def set_input_edid(request: EdidUpdateRequest):
+    command = f"EZS IN{request.input_number} EDID {request.edid_index}"
+    safe_serial_write(command)
+    return {"status": "command_sent", "command": command}
+
+class VideoSwitchRequest(BaseModel):
+    output_number: int = Field(..., ge=0, le=2)
+    input_number: int = Field(..., ge=1, le=4)
+
+@app.post("/output/switch")
+def switch_output_source(request: VideoSwitchRequest):
+    command = f"EZS OUT{request.output_number} VS IN{request.input_number}"
+    safe_serial_write(command)
+    return {"status": "command_sent", "command": command}

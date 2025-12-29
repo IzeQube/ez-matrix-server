@@ -1,0 +1,27 @@
+[Unit]
+Description=EZ Matrix MQTT & REST Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+# CHANGE 'pi' to your actual username
+User=sriram
+Group=sriram
+
+# Set the working directory to where your script is located
+WorkingDirectory=/home/sriram/serialrestservice
+
+# Command to run the app. 
+# If using a virtual env, use: /home/pi/serialrestservice/venv/bin/python
+# If using global python, use: /usr/bin/python3
+ExecStart=/home/sriram/serialrestservice/bin/python -m uvicorn websocketservice:app --host 0.0.0.0 --port 8000
+
+# restart automatically if it crashes
+Restart=always
+RestartSec=5
+
+# Environment variables (optional)
+# Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

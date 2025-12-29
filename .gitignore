@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+bin/
+pyenv.cfg
+lib/
+include/
+lib64/

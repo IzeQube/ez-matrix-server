@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+pyserial
+paho-mqtt
+pydantic

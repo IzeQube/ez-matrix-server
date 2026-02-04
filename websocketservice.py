@@ -1,12 +1,14 @@
 import asyncio
-import serial
-import time
 import json
+import os
 import threading
+import time
+
+import serial
 import paho.mqtt.client as mqtt
+from fastapi import FastAPI
 from pydantic import BaseModel, Field
-from typing import Dict, Any, Optional
-from fastapi import FastAPI, HTTPException
+from typing import Any, Dict
 
 app = FastAPI()
 
@@ -26,11 +28,37 @@ device_state = {
     }
 }
 
+# --- Helpers for Environment Parsing ---
+def _int_env(key: str, default: int) -> int:
+    raw_value = os.getenv(key)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        print(f"Invalid int for {key}: {raw_value}, defaulting to {default}")
+        return default
+
+
+def _float_env(key: str, default: float) -> float:
+    raw_value = os.getenv(key)
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        print(f"Invalid float for {key}: {raw_value}, defaulting to {default}")
+        return default
+
+
 # --- Configuration ---
-MQTT_BROKER = "192.168.60.16"
-MQTT_PORT = 1883
-MQTT_TOPIC_STATUS = "serial/status"
-MQTT_TOPIC_CONTROL_ROOT = "serial/control"
+MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.60.16")
+MQTT_PORT = _int_env("MQTT_PORT", 1883)
+MQTT_TOPIC_STATUS = os.getenv("MQTT_TOPIC_STATUS", "serial/status")
+MQTT_TOPIC_CONTROL_ROOT = os.getenv("MQTT_TOPIC_CONTROL_ROOT", "serial/control")
+SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/ttyUSB0")
+SERIAL_BAUDRATE = _int_env("SERIAL_BAUDRATE", 57600)
+SERIAL_TIMEOUT = _float_env("SERIAL_TIMEOUT", 1.0)
 
 # --- Serial & Locking ---
 # We need a lock because MQTT (Thread A) and REST API (Thread B) might write simultaneously
@@ -38,10 +66,10 @@ serial_lock = threading.Lock()
 serial_message_queue: asyncio.Queue[str] = asyncio.Queue()
 
 try:
-    ser = serial.Serial('/dev/ttyUSB0', baudrate=57600, timeout=1)
+    ser = serial.Serial(SERIAL_PORT, baudrate=SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT)
     device_state["device_status"] = "Online"
 except Exception as e:
-    print(f"Serial Port Error: {e}")
+    print(f"Serial Port Error ({SERIAL_PORT}): {e}")
     ser = None
     device_state["device_status"] = f"Error: {e}"
 

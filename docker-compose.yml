@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  ez-matrix-server:
+    build: .
+    container_name: ez-matrix-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+    environment:
+      MQTT_BROKER: 192.168.60.16
+      MQTT_PORT: 1883
+      SERIAL_PORT: /dev/ttyUSB0
+      SERIAL_BAUDRATE: 57600
+      SERIAL_TIMEOUT: 1

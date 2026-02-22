@@ -301,11 +301,16 @@ async def serial_reader_task():
                     await serial_message_queue.put(line)
             except IOError:
                 # Connection lost, mark as disconnected and let reconnect task handle it
-                print("Serial read failed - connection lost")
+                print("Serial read failed - connection lost (IOError)")
+                serial_manager.disconnect()
                 device_state["device_status"] = "Reconnecting..."
                 await asyncio.sleep(1)
             except Exception as e:
+                # Stale port or other serial errors - force disconnect and reconnect
                 print(f"Serial Read Error: {e}")
+                print("Forcing disconnect to trigger reconnect...")
+                serial_manager.disconnect()
+                device_state["device_status"] = "Reconnecting..."
                 await asyncio.sleep(1)
         else:
             # Not connected, wait before checking again
@@ -335,7 +340,9 @@ async def perform_initial_state_query():
         return
     
     print("Performing state query...")
-    queries = ["EZG STA", "EZG CAS"]
+    # Note: Device sends status automatically on boot/reconnect
+    # EZG STA causes CMD ERR on some models, removed
+    queries = ["EZG CAS"]
     
     for cmd in queries:
         safe_serial_write(cmd)

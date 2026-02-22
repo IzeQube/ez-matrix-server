@@ -5,6 +5,7 @@ services:
     build: .
     container_name: ez-matrix-server
     restart: unless-stopped
+    privileged: true
     ports:
       - "8000:8000"
     devices:
@@ -12,6 +13,8 @@ services:
     environment:
       MQTT_BROKER: 192.168.60.16
       MQTT_PORT: 1883
+      MQTT_TOPIC_DEVICE_AVAILABLE: serial/device/available
       SERIAL_PORT: /dev/ttyUSB0
       SERIAL_BAUDRATE: 57600
       SERIAL_TIMEOUT: 1
+      SERIAL_RECONNECT_INTERVAL: 60

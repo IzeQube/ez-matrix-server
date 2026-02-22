@@ -51,46 +51,122 @@ def _float_env(key: str, default: float) -> float:
         return default
 
 
+# --- Serial Connection Manager ---
+class SerialConnectionManager:
+    """Manages serial connection with automatic reconnection support."""
+    
+    def __init__(self, port: str, baudrate: int, timeout: float):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.ser: serial.Serial | None = None
+        self._lock = threading.Lock()
+        self._is_connected = False
+        self._last_error = None
+    
+    def connect(self) -> bool:
+        """Attempts to connect to serial port. Returns True if successful."""
+        with self._lock:
+            try:
+                if self.ser and self.ser.is_open:
+                    self.ser.close()
+                
+                self.ser = serial.Serial(self.port, baudrate=self.baudrate, timeout=self.timeout)
+                self._is_connected = True
+                self._last_error = None
+                print(f"✓ Serial connected: {self.port}")
+                return True
+            except Exception as e:
+                self._is_connected = False
+                self._last_error = str(e)
+                self.ser = None
+                print(f"✗ Serial connection failed: {e}")
+                return False
+    
+    def disconnect(self):
+        """Safely closes serial connection."""
+        with self._lock:
+            try:
+                if self.ser and self.ser.is_open:
+                    self.ser.close()
+                    print(f"Serial disconnected: {self.port}")
+            except Exception as e:
+                print(f"Error during disconnect: {e}")
+            finally:
+                self._is_connected = False
+                self.ser = None
+    
+    def is_connected(self) -> bool:
+        """Returns connection status."""
+        with self._lock:
+            return self._is_connected and self.ser is not None and self.ser.is_open
+    
+    def write(self, command: str) -> bool:
+        """Thread-safe write to serial port. Returns True if successful."""
+        with self._lock:
+            if not self._is_connected or not self.ser or not self.ser.is_open:
+                return False
+            try:
+                print(f"TX: {command}")
+                self.ser.write(f"{command}\r".encode('utf-8'))
+                return True
+            except Exception as e:
+                print(f"Serial Write Error: {e}")
+                self._is_connected = False
+                return False
+    
+    def readline(self) -> bytes:
+        """Thread-safe read from serial port. May raise exceptions."""
+        with self._lock:
+            if not self.ser or not self.ser.is_open:
+                raise IOError("Serial port not open")
+            return self.ser.readline()
+    
+    def get_status(self) -> str:
+        """Returns human-readable status."""
+        if self.is_connected():
+            return "Online"
+        elif self._last_error:
+            return f"Error: {self._last_error}"
+        else:
+            return "Reconnecting..."
+
+
 # --- Configuration ---
 MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.60.16")
 MQTT_PORT = _int_env("MQTT_PORT", 1883)
 MQTT_TOPIC_STATUS = os.getenv("MQTT_TOPIC_STATUS", "serial/status")
 MQTT_TOPIC_CONTROL_ROOT = os.getenv("MQTT_TOPIC_CONTROL_ROOT", "serial/control")
+MQTT_TOPIC_DEVICE_AVAILABLE = os.getenv("MQTT_TOPIC_DEVICE_AVAILABLE", "serial/device/available")
 SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/ttyUSB0")
 SERIAL_BAUDRATE = _int_env("SERIAL_BAUDRATE", 57600)
 SERIAL_TIMEOUT = _float_env("SERIAL_TIMEOUT", 1.0)
+SERIAL_RECONNECT_INTERVAL = _float_env("SERIAL_RECONNECT_INTERVAL", 60.0)
 
 # --- Serial & Locking ---
-# We need a lock because MQTT (Thread A) and REST API (Thread B) might write simultaneously
-serial_lock = threading.Lock()
 serial_message_queue: asyncio.Queue[str] = asyncio.Queue()
+serial_manager = SerialConnectionManager(SERIAL_PORT, SERIAL_BAUDRATE, SERIAL_TIMEOUT)
 
-try:
-    ser = serial.Serial(SERIAL_PORT, baudrate=SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT)
+# Initial connection attempt
+if serial_manager.connect():
     device_state["device_status"] = "Online"
-except Exception as e:
-    print(f"Serial Port Error ({SERIAL_PORT}): {e}")
-    ser = None
-    device_state["device_status"] = f"Error: {e}"
+else:
+    device_state["device_status"] = "Reconnecting..."
 
 # --- Helper: Thread-Safe Serial Write ---
 def safe_serial_write(command: str):
-    """Writes to serial port using a lock to prevent collisions."""
-    with serial_lock:
-        if ser and ser.is_open:
-            try:
-                print(f"TX: {command}")
-                ser.write(f"{command}\r".encode('utf-8'))
-            except Exception as e:
-                print(f"Serial Write Error: {e}")
+    """Writes to serial port using the connection manager."""
+    if not serial_manager.write(command):
+        print(f"Command ignored (not connected): {command}")
 
 # --- MQTT Callbacks ---
 
 def on_connect(client, userdata, flags, rc):
     """Subscribes to control topics upon connection."""
     print(f"Connected to MQTT Broker with result code {rc}")
-    # Subscribe to all control topics
+    # Subscribe to all control topics and device availability
     client.subscribe(f"{MQTT_TOPIC_CONTROL_ROOT}/#")
+    client.subscribe(MQTT_TOPIC_DEVICE_AVAILABLE)
 
 def on_message(client, userdata, msg):
     """
@@ -99,6 +175,7 @@ def on_message(client, userdata, msg):
       - serial/control/refresh  (Payload: any)
       - serial/control/switch   (Payload: {"output": 1, "input": 2})
       - serial/control/edid     (Payload: {"input": 1, "index": 3})
+      - serial/device/available (Payload: any) - triggers immediate reconnect
     """
     topic = msg.topic
     try:
@@ -109,9 +186,13 @@ def on_message(client, userdata, msg):
 
     print(f"MQTT RX: {topic} | {payload}")
 
-    if topic.endswith("/refresh"):
+    if topic == MQTT_TOPIC_DEVICE_AVAILABLE:
+        # Device is available - trigger immediate reconnect
+        print("Device availability signal received, triggering reconnect...")
+        asyncio.run_coroutine_threadsafe(trigger_serial_reconnect(), app.loop)
+
+    elif topic.endswith("/refresh"):
         # Trigger a full status query
-        # We schedule this on the main event loop to handle the delays properly
         asyncio.run_coroutine_threadsafe(perform_initial_state_query(), app.loop)
 
     elif topic.endswith("/switch"):
@@ -165,21 +246,69 @@ def update_state_from_serial(line: str):
 
 # --- Background Tasks ---
 
+async def trigger_serial_reconnect():
+    """Immediately attempts to reconnect to serial device."""
+    print("Manual reconnect triggered...")
+    if not serial_manager.is_connected():
+        serial_manager.disconnect()
+        if serial_manager.connect():
+            device_state["device_status"] = serial_manager.get_status()
+            # Perform state query after successful reconnect
+            await perform_initial_state_query()
+        else:
+            device_state["device_status"] = serial_manager.get_status()
+
+
+async def serial_reconnect_task():
+    """Periodically checks connection and attempts reconnect if needed."""
+    await asyncio.sleep(10)  # Initial delay to let things settle
+    
+    while True:
+        try:
+            if not serial_manager.is_connected():
+                prev_status = device_state["device_status"]
+                device_state["device_status"] = "Reconnecting..."
+                
+                print(f"Connection lost, attempting reconnect to {SERIAL_PORT}...")
+                serial_manager.disconnect()
+                
+                if serial_manager.connect():
+                    device_state["device_status"] = "Online"
+                    print("✓ Reconnection successful, querying state...")
+                    await perform_initial_state_query()
+                else:
+                    device_state["device_status"] = serial_manager.get_status()
+            else:
+                # Update status to reflect current connection state
+                device_state["device_status"] = serial_manager.get_status()
+            
+        except Exception as e:
+            print(f"Error in reconnect task: {e}")
+        
+        await asyncio.sleep(SERIAL_RECONNECT_INTERVAL)
+
+
 async def serial_reader_task():
     """Reads from serial port continuously."""
     while True:
-        if ser and ser.is_open:
+        if serial_manager.is_connected():
             try:
                 # Use executor for blocking read
-                line_bytes = await asyncio.to_thread(ser.readline)
+                line_bytes = await asyncio.to_thread(serial_manager.readline)
                 line = line_bytes.decode('utf-8').strip()
                 if line:
                     print(f"RX: {line}")
                     await serial_message_queue.put(line)
+            except IOError:
+                # Connection lost, mark as disconnected and let reconnect task handle it
+                print("Serial read failed - connection lost")
+                device_state["device_status"] = "Reconnecting..."
+                await asyncio.sleep(1)
             except Exception as e:
                 print(f"Serial Read Error: {e}")
                 await asyncio.sleep(1)
         else:
+            # Not connected, wait before checking again
             await asyncio.sleep(1)
 
 async def status_processor_task():
@@ -201,6 +330,10 @@ async def status_processor_task():
 
 async def perform_initial_state_query():
     """Sends queries to populate the memory."""
+    if not serial_manager.is_connected():
+        print("Cannot query state: not connected")
+        return
+    
     print("Performing state query...")
     queries = ["EZG STA", "EZG CAS"]
     
@@ -218,12 +351,18 @@ async def startup_event():
     try:
         mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
         mqtt_client.loop_start()
+        print(f"✓ MQTT connected to {MQTT_BROKER}:{MQTT_PORT}")
     except Exception as e:
         print(f"MQTT Connection Failed: {e}")
 
+    # Start background tasks
     asyncio.create_task(serial_reader_task())
     asyncio.create_task(status_processor_task())
-    asyncio.create_task(perform_initial_state_query())
+    asyncio.create_task(serial_reconnect_task())
+    
+    # Initial state query if connected
+    if serial_manager.is_connected():
+        asyncio.create_task(perform_initial_state_query())
 
 @app.on_event("shutdown")
 async def shutdown_event():

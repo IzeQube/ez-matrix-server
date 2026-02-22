@@ -1,0 +1,85 @@
+# Home Assistant Automation für EZ Matrix Server Serial Reconnect
+# 
+# Installation:
+# 1. Diese Datei nach Home Assistant kopieren: /config/automations.yaml
+#    ODER als neue Automation über UI: Settings > Automations & Scenes > Create Automation > Edit in YAML
+# 2. Device/Entity in den Triggern anpassen (siehe Kommentare unten)
+# 3. MQTT Broker-Konfiguration prüfen (sollte bereits konfiguriert sein)
+# 4. Automation speichern und aktivieren
+
+alias: "EZ Matrix Server - Serial Device Reconnect"
+description: "Sendet MQTT-Signal wenn serielles Gerät verfügbar wird"
+
+# === TRIGGER-OPTIONEN (Eine auswählen und anpassen) ===
+
+trigger:
+  # Option 1: USB-Gerät wird verfügbar (z.B. via USB-Automations Integration)
+  # Ersetze 'binary_sensor.your_usb_device' mit deinem tatsächlichen Sensor
+  - platform: state
+    entity_id: binary_sensor.your_usb_device  # <-- HIER ANPASSEN
+    to: "on"
+    from: "off"
+
+  # Option 2: Gerät wird nach Stromausfall wieder verfügbar
+  # Ersetze 'switch.your_power_switch' mit deinem Smart Plug
+  # - platform: state
+  #   entity_id: switch.your_power_switch  # <-- HIER ANPASSEN
+  #   to: "on"
+  #   for:
+  #     seconds: 5  # Warte 5s bis Gerät hochgefahren ist
+
+  # Option 3: Ping-basiert (wenn Gerät Netzwerk-fähig ist)
+  # - platform: state
+  #   entity_id: binary_sensor.your_device_ping  # <-- HIER ANPASSEN
+  #   to: "on"
+  #   from: "off"
+
+  # Option 4: Manueller Button-Trigger (für Tests)
+  # - platform: state
+  #   entity_id: input_boolean.trigger_serial_reconnect
+  #   to: "on"
+
+# === BEDINGUNGEN (Optional) ===
+condition: []
+
+# === AKTIONEN ===
+action:
+  - service: mqtt.publish
+    data:
+      topic: "serial/device/available"
+      payload: '{"timestamp": "{{ now().isoformat() }}", "source": "home_assistant"}'
+      qos: 1
+      retain: false
+
+  # Optional: Debug-Notification
+  - service: notify.persistent_notification
+    data:
+      title: "EZ Matrix Server"
+      message: "Serial reconnect signal gesendet ({{ now().strftime('%H:%M:%S') }})"
+
+  # Optional: Log-Eintrag
+  - service: system_log.write
+    data:
+      message: "EZ Matrix Server: Serial device reconnect triggered"
+      level: info
+
+mode: single  # Verhindert parallele Ausführungen
+max_exceeded: silent
+
+
+# === ZUSÄTZLICHE KONFIGURATION (Optional) ===
+
+# Falls du einen manuellen Test-Button möchtest, füge das in configuration.yaml hinzu:
+# 
+# input_boolean:
+#   trigger_serial_reconnect:
+#     name: "EZ Matrix: Trigger Reconnect"
+#     icon: mdi:usb
+
+
+# === MQTT-TEST via Home Assistant Developer Tools ===
+# 
+# Service: mqtt.publish
+# Data:
+#   topic: serial/device/available
+#   payload: '{"test": true}'
